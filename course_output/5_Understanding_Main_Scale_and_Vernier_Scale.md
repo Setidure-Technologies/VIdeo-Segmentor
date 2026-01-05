@@ -1,0 +1,1 @@
+Error generating content: Error code: 400 - {'error': {'message': 'messages[0].content must be a string', 'type': 'invalid_request_error', 'param': 'messages[0].content'}}
