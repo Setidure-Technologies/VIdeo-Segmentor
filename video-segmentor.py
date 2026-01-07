@@ -21,10 +21,11 @@ VISION_MODEL_DEFAULT = "llama-3.2-90b-vision-preview"
 DISCOVERY_PROMPT = """
 You are an expert Instructional Designer. Analyze the provided VIDEO TRANSCRIPT and break the video down into distinct learning modules (topics).
 The transcript is provided with exact timestamps in the format: `[start-end]: text`.
+**NOTE:** The transcript may be in **Hindi, English, or a mix (Hinglish)**. You must process the content and output the structure **strictly in English**.
 
 Your goal is to identify the logical flow of the content and map it to specific time ranges.
 For each module:
-1.  Identify the main topic being discussed.
+1.  Identify the main topic being discussed (In English).
 2.  **CRITICAL**: Use the provided timestamp ranges to determine the exact start and end time.
 3.  Ensure modules do not overlap and cover the entire meaningful content.
 
@@ -42,6 +43,7 @@ You are an expert Professor creating a concise course module for the topic: "{to
 Focus on the provided video frames which correspond to the segment from {start} seconds to {end} seconds.
 
 Output strictly in Markdown with these specific headers. Keep content clear, concise, and bite-sized (Cue Card style).
+**IMPORTANT:** Write all content **strictly in English**, even if the video/transcript is in Hindi or another language.
 
 ## Objectives
 - Bullet points of what is learned.
