@@ -19,11 +19,28 @@ VISION_MODEL_DEFAULT = "llama-3.2-90b-vision-preview"
 
 # 1. THE ARCHITECT: Identifies the structure from TRANSCRIPT
 DISCOVERY_PROMPT = """
-You are an expert Instructional Designer. Analyze the provided VIDEO TRANSCRIPT and break the video down into distinct learning modules (topics).
+You are an expert Instructional Designer. Analyze the provided VIDEO TRANSCRIPT and identify the core learning modules.
 The transcript is provided with exact timestamps in the format: `[start-end]: text`.
 **NOTE:** The transcript may be in **Hindi, English, or a mix (Hinglish)**. You must process the content and output the structure **strictly in English**.
 
-Your goal is to identify the logical flow of the content and map it to specific time ranges.
+### CRITICAL PHILOSOPHY: BE A "LUMPER", NOT A "SPLITTER"
+Your goal is to create the **FEWEST** number of modules necessary to cover the content effectively.
+Avoid fragmentation. A module must be a **complete, standalone lesson**.
+
+### RULES FOR SEGMENTATION:
+1.  **CONCEPT COMPLETENESS**:
+    - **BAD**: Mod 1: "Definition" (30s), Mod 2: "Types" (30s), Mod 3: "Example" (30s). -> *User is confused.*
+    - **GOOD**: Mod 1: "Complete Guide to [Topic]" (90s). -> *Includes definition, types, and examples.*
+    - **RULE**: Always MERGE "Introduction", "Definition", "Mechanism", "Types", "Advantages", and "Examples" of the same subject into ONE single module.
+
+2.  **STRICT DURATION LOGIC**:
+    - **Video < 5 Minutes**: Create exactly **ONE** module. (Unless there is a hard topic switch like "Sports" to "Cooking").
+    - **Video > 5 Minutes**: Create modules that are **at least 2 minutes long** if possible.
+    - If a potential segment is under 60 seconds, **IT IS TOO SHORT**. Merge it with the previous or next module.
+
+3.  **PROCEDURAL FLOW**:
+    - If the video is a step-by-step tutorial ("Step 1, Step 2, Step 3"), keep all steps in **ONE** module called "Process of X", unless the process is extremely long (>10 mins).
+
 For each module:
 1.  Identify the main topic being discussed (In English).
 2.  **CRITICAL**: Use the provided timestamp ranges to determine the exact start and end time.
@@ -31,34 +48,53 @@ For each module:
 
 Return ONLY a raw JSON array:
 [
-  {"topic_name": "Introduction to React", "start_time": 0.0, "end_time": 15.5},
-  {"topic_name": "Setting up the Environment", "start_time": 15.5, "end_time": 120.0},
+  {"topic_name": "Comprehensive Guide to React Components", "start_time": 0.0, "end_time": 180.5},
   ...
 ]
 """
 
-# 2. THE PROFESSOR: Creates the content
+# 2. THE PROFESSOR: Creates the content (NOTES ONLY)
 CONTENT_PROMPT_TEMPLATE = """
 You are an expert Professor creating a concise course module for the topic: "{topic}".
-Focus on the provided video frames which correspond to the segment from {start} seconds to {end} seconds.
+Focus on the provided video frames AND the following TRANSCRIPT SEGMENT:
 
-Output strictly in Markdown with these specific headers. Keep content clear, concise, and bite-sized (Cue Card style).
-**IMPORTANT:** Write all content **strictly in English**, even if the video/transcript is in Hindi or another language.
+<TRANSCRIPT_SEGMENT>
+{transcript_segment}
+</TRANSCRIPT_SEGMENT>
 
-## Objectives
-- Bullet points of what is learned.
+The segment corresponds to the time {start} seconds to {end} seconds.
+Use the transcript as the PRIMARY source of information.
+
+Output strictly in Markdown. Keep content clear, concise, and bite-sized (Cue Card style).
+**IMPORTANT:** Write all content **strictly in English**.
 
 ## Notes
 - Concise technical explanation.
 - Bullet points for key concepts.
+"""
 
+# 3. THE ARCHITECT - GLOBAL INTRO
+INTRO_PROMPT = """
+You are an expert Instructional Designer. Analyze the FULL COURSE TRANSCRIPT provided below.
+Identify the 3-5 distinct learning objectives for this entire video course.
+
+Output strictly in Markdown:
+## Objectives
+- Bullet point 1
+- Bullet point 2...
+"""
+
+# 4. THE ARCHITECT - GLOBAL OUTRO
+OUTRO_PROMPT = """
+You are an expert Instructional Designer. Analyze the FULL COURSE TRANSCRIPT provided below.
+Extract all key Definitions and specific Practical Applications mentioned or implied in the course.
+
+Output strictly in Markdown:
 ## Definitions
-- Key terms defined briefly.
+- **Term**: Definition...
 
 ## Practical Application
-- Real-world usage examples.
-
-Do not include a quiz here. Do not header anything else.
+- Real-world usage examples...
 """
 
 # 3. THE EXAMINER: Creates the final assessment
@@ -203,7 +239,7 @@ class CourseGenerator:
             # Validation
             if not isinstance(data, list):
                 print(f"❌ Error: Expected JSON array, got {type(data)}.")
-                return []
+                return [], ""
                 
             valid_modules = []
             for item in data:
@@ -216,20 +252,137 @@ class CourseGenerator:
             if os.path.exists(audio_file):
                 os.remove(audio_file)
 
-            return valid_modules
+            # --- POST-PROCESSING: SMART MERGE ---
+            print(f"   🧹 Post-processing: Merging short segments (under 60s)...")
+            final_modules = self.smart_merge_modules(valid_modules, min_duration=60)
+            print(f"   ✅ Merged {len(valid_modules)} -> {len(final_modules)} modules.")
+
+            return final_modules, transcript_text
             
         except Exception as e:
             import traceback
             traceback.print_exc()
             print(f"❌ Error during analysis: {str(e)}")
-            return []
+            return [], ""
 
-    def generate_module_content(self, video_file, topic, start, end):
-        """Step 2: Generate the text course content for a specific segment using VISION."""
+    def smart_merge_modules(self, modules, min_duration=60):
+        """
+        Iteratively merges modules smaller than min_duration.
+        Strategy:
+        - If module < min_duration:
+          - Merge with PREVIOUS if exists (preferred for sub-points).
+          - Else merge with NEXT.
+        - Name Priority: Keep the name of the LONGER segment (Topic Integrity).
+        """
+        if not modules: return []
+        
+        # Make a copy to avoid mutating original list while iterating (though we restart loop)
+        current_modules = modules.copy()
+        
+        while True:
+            # 1. Check if any module is too short
+            too_short_index = -1
+            shortest_duration = float('inf')
+            
+            for i, mod in enumerate(current_modules):
+                dur = mod['end_time'] - mod['start_time']
+                if dur < min_duration:
+                    if dur < shortest_duration:
+                        shortest_duration = dur
+                        too_short_index = i
+            
+            # If no short modules found, or only 1 module left, we are done
+            if too_short_index == -1 or len(current_modules) <= 1:
+                break
+                
+            # 2. Merge Logic
+            # We found a short module at `too_short_index`.
+            target_idx = too_short_index
+            
+            # Decide neighbor: Prev (i-1) or Next (i+1)
+            # Default: Merge into PREV (e.g. Example merges into Definition)
+            # But if it's the first one, must merge into NEXT.
+            
+            output_modules = []
+            
+            if target_idx > 0:
+                # Merge with PREV
+                prev_mod = current_modules[target_idx - 1]
+                short_mod = current_modules[target_idx]
+                
+                # Check who is dominant (Longer duration wins name)
+                prev_dur = prev_mod['end_time'] - prev_mod['start_time']
+                short_dur = short_mod['end_time'] - short_mod['start_time']
+                
+                new_name = prev_mod['topic_name'] if prev_dur >= short_dur else short_mod['topic_name']
+                
+                merged_mod = {
+                    "topic_name": new_name,
+                    "start_time": prev_mod['start_time'],
+                    "end_time": short_mod['end_time']
+                }
+                
+                # Reconstruct list
+                # All before prev + new + all after short
+                output_modules = current_modules[:target_idx-1] + [merged_mod] + current_modules[target_idx+1:]
+                
+                print(f"      🔹 Merged '{short_mod['topic_name']}' ({short_dur:.1f}s) ⬅️ INTO '{prev_mod['topic_name']}'")
+                
+            else:
+                # Must be index 0, Merge with NEXT
+                short_mod = current_modules[0]
+                next_mod = current_modules[1]
+                
+                short_dur = short_mod['end_time'] - short_mod['start_time']
+                next_dur = next_mod['end_time'] - next_mod['start_time']
+                
+                new_name = next_mod['topic_name'] if next_dur >= short_dur else short_mod['topic_name']
+                
+                merged_mod = {
+                    "topic_name": new_name,
+                    "start_time": short_mod['start_time'],
+                    "end_time": next_mod['end_time']
+                }
+                
+                output_modules = [merged_mod] + current_modules[2:]
+                
+                print(f"      🔹 Merged '{short_mod['topic_name']}' ({short_dur:.1f}s) INTO ➡️ '{next_mod['topic_name']}'")
+            
+            current_modules = output_modules
+            
+        return current_modules
+
+    def generate_module_content(self, video_file, topic, start, end, transcript_text):
+        """Step 2: Generate the text course content for a specific segment using VISION + TRANSCRIPT."""
         print(f"   ✍️  Writing course content for: {topic}...")
         
+        # Filter transcript for context (naive filter or just pass relevant chunk if we have it, 
+        # but simplest is to pass the whole thing and let LLM find the timestamps or just pass the relevant snippet)
+        # For robustness, we will extract lines that fall roughly within the start/end window.
+        
+        relevant_lines = []
+        try:
+            lines = transcript_text.split('\n')
+            for line in lines:
+                # Expected format: [start - end]: text
+                if "[" in line and "]" in line:
+                    try:
+                        time_part = line.split("]")[0].replace("[", "")
+                        t_start, t_end = map(float, time_part.replace("s", "").split("-"))
+                        
+                        # basic overlap check
+                        if t_start >= start and t_start <= end:
+                            relevant_lines.append(line)
+                    except:
+                        continue
+        except:
+            relevant_lines = [transcript_text] # Fallback
+
+        transcript_segment = "\n".join(relevant_lines)
+        if not transcript_segment: description = "No speech detected in this segment."
+
         specific_prompt = CONTENT_PROMPT_TEMPLATE.format(
-            topic=topic, start=start, end=end
+            topic=topic, start=start, end=end, transcript_segment=transcript_segment
         )
         
         # Extract frames limits to 5 for Groq Vision
@@ -279,6 +432,36 @@ class CourseGenerator:
             print(f"❌ Error generating content: {e}")
             return f"Error generating content: {e}"
 
+    def generate_course_intro(self, transcript_text):
+        """Generates global course objectives."""
+        print("   🚀 Generating Course Objectives...")
+        try:
+            return self._text_completion(INTRO_PROMPT, transcript_text)
+        except Exception as e:
+            print(f"Error generating intro: {e}")
+            return "## Objectives\n- content generation failed."
+
+    def generate_course_outro(self, transcript_text):
+        """Generates global definitions and practical applications."""
+        print("   🏁 Generating Course Outro...")
+        try:
+            return self._text_completion(OUTRO_PROMPT, transcript_text)
+        except Exception as e:
+            print(f"Error generating outro: {e}")
+            return "## Definitions\n- None\n\n## Practical Application\n- None"
+
+    def _text_completion(self, system_prompt, user_content):
+        """Helper for text-only completions."""
+        completion = self.client.chat.completions.create(
+            model=STRUCTURE_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.3
+        )
+        return completion.choices[0].message.content
+
     def generate_quiz(self, transcript_text):
         """Step 3: Generate the Final Assessment Quiz."""
         print("   🎓 Generating Final Assessment...")
@@ -292,7 +475,7 @@ class CourseGenerator:
                     },
                     {
                         "role": "user",
-                        "content": f"Here is the full course transcript. Generate the quiz based on this:\n\n{transcript_text[:15000]}" # LIMIT context to avoid overflow if very long
+                        "content": f"Here is the full course transcript. Generate the quiz strictly based on this content:\n\n{transcript_text}" 
                     }
                 ],
                 temperature=0.2,
@@ -310,7 +493,7 @@ class CourseGenerator:
             os.makedirs(output_dir)
 
         # 1. Analyze Structure
-        modules = self.analyze_structure(source_path) 
+        modules, transcript_text = self.analyze_structure(source_path) 
         
         if not modules:
             print("❌ No modules generated.")
@@ -345,7 +528,7 @@ class CourseGenerator:
                     print(f"   ⚠️ Invalid duration (Start: {start}, End: {end}). Skipping clip.")
                 
                 # B. WRITE THE COURSE CONTENT
-                course_content = self.generate_module_content(source_path, module['topic_name'], start, end)
+                course_content = self.generate_module_content(source_path, module['topic_name'], start, end, transcript_text)
                 
                 md_filename = f"{base_name}.md"
                 save_path_md = os.path.join(output_dir, md_filename)

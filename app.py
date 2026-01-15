@@ -141,7 +141,7 @@ if uploaded_file and api_key:
             st.write(f"🎧 Extracting Audio & Transcribing (Groq Whisper)...")
             st.write(f"🧠 Analyzing Topics (Llama 3 70B)...")
             
-            modules = generator.analyze_structure(gemini_file)
+            modules, transcript_text = generator.analyze_structure(gemini_file)
             
             if not modules:
                 status.update(label="Analysis Failed", state="error")
@@ -152,105 +152,97 @@ if uploaded_file and api_key:
             status.update(label="Structure Analyzed", state="complete")
         
 
+     
+            # --- 1. GLOBAL OBJECTIVES ---
+            st.divider()
+            with st.spinner("Generating Course Objectives..."):
+                intro_content = generator.generate_course_intro(transcript_text)
+                intro_sections = parse_markdown_to_cards(intro_content)
+                render_cue_card("Course Objectives", intro_sections.get('objectives', intro_content), 'card-red')
 
-        # 3. Generate Modules
-        results_container = st.container()
-        progress_bar = st.progress(0)
-        
-        with VideoFileClip(temp_filename) as video:
-            for idx, module in enumerate(modules):
-                progress = (idx) / len(modules)
-                progress_bar.progress(progress, text=f"Processing Module {idx+1}/{len(modules)}: {module['topic_name']}")
-                
-                topic_clean = module['topic_name'].replace(" ", "_").replace("/", "-")
-                base_name = f"{idx+1}_{topic_clean}"
-                
-                col1, col2 = results_container.columns([1, 1])
-                
-                with col1:
-                    st.subheader(f"Module {idx+1}: {module['topic_name']}")
-                    st.caption(f"Time: {module['start_time']}s - {module['end_time']}s")
+            # --- 2. MODULES (NOTES ONLY) ---
+            st.divider()
+            results_container = st.container()
+            progress_bar = st.progress(0)
+            
+            with VideoFileClip(temp_filename) as video:
+                for idx, module in enumerate(modules):
+                    progress = (idx) / len(modules)
+                    progress_bar.progress(progress, text=f"Processing Module {idx+1}/{len(modules)}: {module['topic_name']}")
                     
-                    # Cut Video
-                    start = float(module['start_time'])
-                    end = float(module['end_time'])
-                    if end > video.duration: end = video.duration
+                    topic_clean = module['topic_name'].replace(" ", "_").replace("/", "-")
+                    base_name = f"{idx+1}_{topic_clean}"
                     
-                    video_filename = f"{base_name}.mp4"
-                    save_path_video = os.path.join(output_dir, video_filename)
+                    col1, col2 = results_container.columns([1, 1])
                     
-                    if start < end:
-                        if not os.path.exists(save_path_video): # Avoid re-processing if exists
-                            new_clip = video.subclipped(start_time=start, end_time=end)
-                            new_clip.write_videofile(save_path_video, codec="libx264", audio_codec="aac", logger=None)
-                        st.video(save_path_video)
-                
-                with col2:
-                    st.write("✍️ Generating Content...")
-                    # Generate Text
-                    course_content = generator.generate_module_content(gemini_file, module['topic_name'], start, end)
+                    with col1:
+                        st.subheader(f"Module {idx+1}: {module['topic_name']}")
+                        st.caption(f"Time: {module['start_time']}s - {module['end_time']}s")
+                        
+                        # Cut Video
+                        start = float(module['start_time'])
+                        end = float(module['end_time'])
+                        if end > video.duration: end = video.duration
+                        
+                        video_filename = f"{base_name}.mp4"
+                        save_path_video = os.path.join(output_dir, video_filename)
+                        
+                        if start < end:
+                            if not os.path.exists(save_path_video): 
+                                new_clip = video.subclipped(start_time=start, end_time=end)
+                                new_clip.write_videofile(save_path_video, codec="libx264", audio_codec="aac", logger=None)
+                            st.video(save_path_video)
                     
-                    md_filename = f"{base_name}.md"
-                    save_path_md = os.path.join(output_dir, md_filename)
-                    with open(save_path_md, "w", encoding="utf-8") as f:
-                        f.write(course_content)
+                    with col2:
+                        st.write("✍️ Generating Notes...")
+                        # Generate Text (NOTES ONLY)
+                        course_content = generator.generate_module_content(gemini_file, module['topic_name'], start, end, transcript_text)
+                        
+                        md_filename = f"{base_name}.md"
+                        save_path_md = os.path.join(output_dir, md_filename)
+                        with open(save_path_md, "w", encoding="utf-8") as f:
+                            f.write(course_content)
+                        
+                        with st.expander("View Notes", expanded=True):
+                            sections = parse_markdown_to_cards(course_content)
+                            # Render ONLY Notes (Green)
+                            render_cue_card("Notes", sections.get('notes', course_content), 'card-green')
+                            
+                            st.download_button(
+                                label="Download Notes",
+                                data=course_content,
+                                file_name=md_filename,
+                                mime="text/markdown",
+                                key=f"dl_{idx}"
+                            )
                     
-                    with st.expander("View Course Content (Cue Cards)", expanded=True):
-                        # Parse
-                        sections = parse_markdown_to_cards(course_content)
-                        
-                        # Render Specific Cards
-                        # Objectives -> Red
-                        render_cue_card("Objectives", sections.get('objectives', ''), 'card-red')
-                        
-                        # Notes -> Green
-                        render_cue_card("Notes", sections.get('notes', ''), 'card-green')
-                        
-                        # Definitions -> Blue
-                        render_cue_card("Definitions", sections.get('definitions', ''), 'card-blue')
-                        
-                        # Practical -> Yellow
-                        render_cue_card("Practical Application", sections.get('practical application', ''), 'card-yellow')
-                        
-                        # Fallback for text download
-                        st.download_button(
-                            label="Download Raw Markdown",
-                            data=course_content,
-                            file_name=md_filename,
-                            mime="text/markdown",
-                            key=f"dl_{idx}"
-                        )
-                
-                # Rate limit wait
-                if idx < len(modules) - 1:
-                    time.sleep(5)
+                    if idx < len(modules) - 1:
+                        time.sleep(2)
 
-        progress_bar.progress(1.0, text="Completed!")
-        st.success("🎉 Course Generation Complete!")
-        
-        # --- FINAL ASSESSMENT ---
-        st.divider()
-        st.header("🎓 Final Assessment")
-        with st.spinner("Generating Final Quiz..."):
-             # We need a full transcript text for the quiz context
-             # Since we don't store it, we can approximate by chaining the modules
-             full_content_context = "\n".join([f"Topic: {m['topic_name']}\nContent: {generator.generate_module_content(gemini_file, m['topic_name'], m['start_time'], m['end_time'])}" for m in modules[:3]]) # Just sample first few for context or re-read transcript if possible. 
-             # Actually, better: we already have the `modules` which implies the structure. Let's just ask for a quiz based on the *structure* or extract the full transcript again? 
-             # To be efficient and accurate, let's allow the generator to re-read the temp audio? No, audio is gone.
-             # Best approach: We should have saved the transcript text.
-             # FIX: Let's assume the user wants a quiz on what they just saw.
-             
-             # For now, let's generate it based on the *module titles* and *content* we just wrote.
-             # We can read the MD files? 
-             all_md_content = ""
-             for file in os.listdir(output_dir):
-                 if file.endswith(".md"):
-                     with open(os.path.join(output_dir, file), "r", encoding="utf-8") as f:
-                         all_md_content += f.read() + "\n"
-                         
-             quiz_data = generator.generate_quiz(all_md_content)
-             st.session_state['quiz_data'] = quiz_data
-             st.session_state['quiz_started'] = True
+            progress_bar.progress(1.0, text="Completed!")
+            
+            # --- 3. GLOBAL OUTRO ---
+            st.divider()
+            with st.spinner("Generating Conclusions..."):
+                outro_content = generator.generate_course_outro(transcript_text)
+                outro_sections = parse_markdown_to_cards(outro_content)
+                
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    render_cue_card("Definitions", outro_sections.get('definitions', ''), 'card-blue')
+                with col_b:
+                    render_cue_card("Practical Application", outro_sections.get('practical application', ''), 'card-yellow')
+
+            st.success("🎉 Course Generation Complete!")
+            
+            # --- 4. FINAL ASSESSMENT ---
+            st.divider()
+            st.header("🎓 Final Assessment")
+            with st.spinner("Generating Final Quiz..."):
+                 # Use FULL TRANSCRIPT for Quiz
+                 quiz_data = generator.generate_quiz(transcript_text)
+                 st.session_state['quiz_data'] = quiz_data
+                 st.session_state['quiz_started'] = True
 
 if st.session_state.get('quiz_started'):
     st.markdown("---")
